@@ -1,0 +1,990 @@
+#!/usr/bin/env bash
+# ego — gerenciador de programas Linux baseado em source
+# Licença: MIT (ajuste se preferir)
+set -euo pipefail
+shopt -s extglob nullglob lastpipe
+
+# ====== Versão ======
+EGO_VERSION="0.1.0"
+
+# ====== Config padrão (pode ser sobreposto por /etc/ego/ego.conf e ~/.config/ego/ego.conf) ======
+EGO_ROOT="${EGO_ROOT:-/}"
+EGO_DESTDIR="${EGO_DESTDIR:-$PWD/dest}"
+EGO_CACHEDIR="${EGO_CACHEDIR:-/var/lib/ego/cache}"
+EGO_DBROOT="${EGO_DBROOT:-/var/lib/ego/db}"
+EGO_LOGDIR="${EGO_LOGDIR:-/var/log/ego}"
+EGO_TMPDIR="${EGO_TMPDIR:-/tmp}"
+EGO_DEFAULT_REPO="${EGO_DEFAULT_REPO:-core}"
+EGO_COLOR="${EGO_COLOR:-auto}"   # auto|always|never
+EGO_SPINNER="${EGO_SPINNER:-1}"
+EGO_FALLBACK_FETCH="${EGO_FALLBACK_FETCH:-curl}" # curl|wget|git-auto
+EGO_VERIFY_CHECKSUM="${EGO_VERIFY_CHECKSUM:-1}"
+EGO_STRIP_BINARIES="${EGO_STRIP_BINARIES:-1}"
+EGO_INTERACTIVE="${EGO_INTERACTIVE:-0}"
+EGO_GIT_PUSH="${EGO_GIT_PUSH:-1}"
+EGO_SYNC_DIR="${EGO_SYNC_DIR:-/srv/ego-repo}"
+EGO_SYNC_GIT="${EGO_SYNC_GIT:-/srv/ego-repo.git}"
+EGO_MAKEFLAGS="${EGO_MAKEFLAGS:--j$(nproc)}"
+EGO_CFLAGS="${EGO_CFLAGS:--O2 -pipe}"
+EGO_CXXFLAGS="${EGO_CXXFLAGS:--O2 -pipe}"
+EGO_LDFLAGS="${EGO_LDFLAGS:-}"
+EGO_CC="${EGO_CC:-cc}"
+EGO_CXX="${EGO_CXX:-c++}"
+EGO_SANDBOX="${EGO_SANDBOX:-0}"
+EGO_PROFILE="${EGO_PROFILE:-}"
+
+# ====== Paths padrão ======
+ETC_DIR="/etc/ego"
+USER_CONF="$HOME/.config/ego/ego.conf"
+GLOBAL_CONF="$ETC_DIR/ego.conf"
+REPOS_DIR="$ETC_DIR/repos.d"
+SHARE_HOOKS="/usr/share/ego/hooks"
+TEMPLATES_DIR="/usr/share/ego/templates"
+
+# ====== Estado global ======
+DRY_RUN=0
+FORCE=0
+DEBUG=0
+INTERACTIVE=0   # habilitado via -I
+SHORT_ALIAS=""
+CMD=""
+ARGS=()
+
+# ====== Cores ======
+is_tty() { [[ -t 1 ]]; }
+color_enabled() {
+  case "$EGO_COLOR" in
+    always) return 0;;
+    never)  return 1;;
+    auto)   is_tty;;
+    *)      is_tty;;
+  esac
+}
+if color_enabled; then
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; MAGENTA=$'\e[35m'; CYAN=$'\e[36m'; RESET=$'\e[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; RESET=""
+fi
+
+# ====== Logging ======
+mkdir -p "$EGO_LOGDIR" "$EGO_DBROOT/installed" "$EGO_CACHEDIR/src" "$EGO_CACHEDIR/build" "$EGO_CACHEDIR/pkgs" "$EGO_DBROOT/lock" || true
+LOG_FILE="$EGO_LOGDIR/$(date +%Y%m%d-%H%M%S)-ego.log"
+log()   { echo -e "${DIM}[$(date +%H:%M:%S)]${RESET} $*"; echo "[$(date -Is)] $*" >> "$LOG_FILE"; }
+info()  { echo -e "${BOLD}${BLUE}==>${RESET} $*"; echo "[INFO] $*" >> "$LOG_FILE"; }
+ok()    { echo -e "${BOLD}${GREEN}✔${RESET} $*"; echo "[OK] $*" >> "$LOG_FILE"; }
+warn()  { echo -e "${YELLOW}⚠${RESET} $*"; echo "[WARN] $*" >> "$LOG_FILE"; }
+err()   { echo -e "${RED}✖${RESET} $*" >&2; echo "[ERROR] $*" >> "$LOG_FILE"; }
+die()   { err "$*"; exit 1; }
+
+# ====== Locks ======
+lock_acquire() {
+  local name="$1" file="$EGO_DBROOT/lock/$name.lock"
+  exec {LOCK_FD}>"$file" || die "não abriu lock $file"
+  flock -n $LOCK_FD || die "processo em execução (lock: $name)"
+}
+lock_release() { :; } # flock fecha ao sair
+
+# ====== Spinner ======
+SPINNER_PID=""
+spinner_start() {
+  [[ "$EGO_SPINNER" -eq 1 && -t 1 ]] || return 0
+  ( while :; do for c in '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'; do echo -ne " $c\r"; sleep 0.1; done; done ) &
+  SPINNER_PID=$!
+}
+spinner_stop() {
+  [[ -n "$SPINNER_PID" ]] && kill "$SPINNER_PID" >/dev/null 2>&1 || true
+  SPINNER_PID=""
+  echo -ne " \r"
+}
+
+# ====== Exec helpers ======
+run() {
+  # run "descrição" cmd ...
+  local desc="$1"; shift
+  info "$desc"
+  if (( DRY_RUN )); then
+    echo "    ${DIM}\$ $*${RESET}"
+    return 0
+  fi
+  spinner_start
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    spinner_stop; ok "$desc"
+  else
+    spinner_stop; err "falhou: $desc (veja $LOG_FILE)"; return 1
+  fi
+}
+
+# ====== Carregar configs ======
+load_conf() {
+  [[ -f "$GLOBAL_CONF" ]] && source "$GLOBAL_CONF"
+  [[ -f "$USER_CONF" ]] && source "$USER_CONF"
+}
+
+# ====== Checksums ======
+sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+verify_sha256() {
+  local file="$1" want="$2"
+  local got; got="$(sha256_of "$file")"
+  [[ "$got" == "$want" ]]
+}
+
+# ====== SemVer ======
+# normaliza "1.2" -> 1.2.0 ; remove sufixos para comparação básica; pré-lanços ordenados menores
+semver_norm() {
+  local v="${1%%-*}"
+  IFS='.' read -r a b c <<<"${v}"
+  echo "${a:-0}.${b:-0}.${c:-0}"
+}
+semver_cmp() { # echo -1, 0, 1
+  local A B; A=$(semver_norm "$1"); B=$(semver_norm "$2")
+  IFS='.' read -r a1 a2 a3 <<<"$A"
+  IFS='.' read -r b1 b2 b3 <<<"$B"
+  for i in 1 2 3; do
+    local x y; x=${!((i==1?0:i))}
+  done
+  # simples:
+  if (( a1 < b1 )); then echo -1; return; elif (( a1 > b1 )); then echo 1; return; fi
+  if (( a2 < b2 )); then echo -1; return; elif (( a2 > b2 )); then echo 1; return; fi
+  if (( a3 < b3 )); then echo -1; return; elif (( a3 > b3 )); then echo 1; return; fi
+  echo 0
+}
+semver_satisfies() { # arg1=installed/ver avail; arg2=constraint like name>=1.2 parsed fora
+  local have="$1" op="$2" ver="$3"
+  case "$op" in
+    "=") [[ "$(semver_cmp "$have" "$ver")" == "0" ]];;
+    ">" ) [[ "$(semver_cmp "$have" "$ver")" == "1" ]];;
+    "<" ) [[ "$(semver_cmp "$have" "$ver")" == "-1" ]];;
+    ">=") cmp="$(semver_cmp "$have" "$ver")"; [[ "$cmp" == "0" || "$cmp" == "1" ]];;
+    "<=") cmp="$(semver_cmp "$have" "$ver")"; [[ "$cmp" == "0" || "$cmp" == "-1" ]];;
+    "~" ) # compat dentro do mesmo MINOR
+         IFS='.' read -r hM hm _ <<<"$(semver_norm "$have")"
+         IFS='.' read -r vM vm _ <<<"$(semver_norm "$ver")"
+         [[ "$hM" == "$vM" && "$hm" == "$vm" ]];;
+    ""  ) return 0;;
+    *   ) return 1;;
+  esac
+}
+
+# ====== Arquivos auxiliares ======
+pkg_installed_dir() { echo "$EGO_DBROOT/installed/$1"; }
+pkg_meta()   { local d; d="$(pkg_installed_dir "$1")"; echo "$d/META"; }
+pkg_los()    { local d; d="$(pkg_installed_dir "$1")"; echo "$d/LOS"; }
+pkg_log()    { local d; d="$(pkg_installed_dir "$1")"; echo "$d/LOG"; }
+
+# ====== Hooks ======
+run_hook_dir() {
+  local hook="$1"
+  for h in "$SHARE_HOOKS/$hook" "$ETC_DIR/hooks.d/"*; do
+    [[ -x "$h" ]] || continue
+    EGO_HOOK="$hook" "$h" || true
+  done
+}
+# ====== Repositórios ======
+# /etc/ego/repos.d/*.conf (linhas: NAME=/caminho/para/repo ou NAME=https://git/...)
+declare -A REPOS
+load_repos() {
+  REPOS=()
+  [[ -d "$REPOS_DIR" ]] || return 0
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" =~ ^# ]] && continue
+      local name="${line%%=*}" val="${line#*=}"
+      REPOS["$name"]="$val"
+    done < "$f"
+  done < <(find "$REPOS_DIR" -type f -name "*.conf" -print)
+}
+
+# caminho da receita: repo/name/ego.build
+find_recipe_path() {
+  local pkg="$1" repo="${2:-$EGO_DEFAULT_REPO}"
+  local base="${REPOS[$repo]}"
+  [[ -z "$base" ]] && die "repo '$repo' não definido"
+  if [[ -d "$base/.git" || "$base" =~ ^https?:// ]]; then
+    # repo git sincronizado localmente para EGO_SYNC_DIR/<repo>
+    local localrepo="$EGO_SYNC_DIR/$repo"
+    [[ -d "$localrepo" ]] || die "repo local $localrepo não existe (rode 'ego sync')"
+    echo "$localrepo/$pkg/ego.build"
+  else
+    echo "$base/$pkg/ego.build"
+  fi
+}
+
+# ====== Carregar receita ======
+# Carrega um ego.build em subshell e exporta vars via arquivo temporário com declare -p
+load_recipe() {
+  local recipe="$1"; [[ -f "$recipe" ]] || die "receita não encontrada: $recipe"
+  local dump; dump="$(mktemp "$EGO_TMPDIR/ego-recipe.XXXX")"
+  (
+    set -euo pipefail
+    srcdir=""; builddir=""; pkgdir=""
+    # inicializa arrays para não herdar nada
+    pkgname=""; pkgver=""; pkgrel="1"; pkgdesc=""; url=""; license=(); arch=(); maintainer=""
+    source=(); sha256sums=(); depends=(); makedepends=(); checkdepends=(); optdepends=()
+    provides=(); conflicts=(); replaces=(); options=()
+    prepare() { :; }; build() { :; }; check() { :; }; package() { :; }; install() { :; }
+    source "$recipe"
+    # dump
+    {
+      declare -p pkgname pkgver pkgrel pkgdesc url license arch maintainer
+      declare -p source sha256sums depends makedepends checkdepends optdepends provides conflicts replaces options
+      declare -f prepare || true; declare -f build || true; declare -f check || true; declare -f package || true; declare -f install || true
+    } > "$dump"
+  )
+  # shellcheck source=/dev/null
+  source "$dump"
+  rm -f "$dump"
+}
+
+# ====== Download ======
+fetch_sources() {
+  local pkg="$1" recipe="$2"
+  local srcdir="$EGO_CACHEDIR/src/$pkg"
+  mkdir -p "$srcdir"
+  local i=0
+  for s in "${source[@]}"; do
+    local url="$s" out
+    # permitir arquivos locais
+    if [[ -f "$recipe/../$s" ]]; then
+      out="$srcdir/$(basename "$s")"
+      cp -f "$recipe/../$s" "$out"
+    elif [[ "$url" =~ ^git://|^https?://.*\.git$ || "$url" =~ ^git@ ]]; then
+      out="$srcdir/$(basename "${url%.git}")-git"
+      if [[ -d "$out/.git" ]]; then
+        run "atualizando git $url" git -C "$out" fetch --all --tags
+      else
+        run "clonando $url" git clone --depth=1 "$url" "$out"
+      fi
+    else
+      out="$srcdir/$(basename "$url")"
+      if [[ ! -s "$out" || "$FORCE" -eq 1 ]]; then
+        if command -v curl >/dev/null 2>&1; then
+          run "baixando (curl) $url" curl -L --fail -o "$out" "$url" || rm -f "$out"
+        elif command -v wget >/dev/null 2>&1; then
+          run "baixando (wget) $url" wget -O "$out" "$url" || rm -f "$out"
+        else
+          die "nem curl nem wget disponíveis"
+        fi
+      else
+        info "usando cache: $out"
+      fi
+    fi
+    # checksum
+    if (( EGO_VERIFY_CHECKSUM )) && [[ -n "${sha256sums[$i]:-}" && -f "$out" && ! -d "$out" ]]; then
+      verify_sha256 "$out" "${sha256sums[$i]}" || die "checksum falhou para $(basename "$out")"
+    fi
+    ((i++))
+  done
+}
+
+# ====== Extração ======
+detect_type() {
+  local f="$1"
+  if [[ -d "$f/.git" ]]; then echo "git"; return; fi
+  case "$f" in
+    *.tar.gz|*.tgz) echo "tar.gz";;
+    *.tar.bz2) echo "tar.bz2";;
+    *.tar.xz) echo "tar.xz";;
+    *.tar.zst|*.tzst) echo "tar.zst";;
+    *.zip) echo "zip";;
+    *.7z) echo "7z";;
+    *.rar) echo "rar";;
+    *) file -b "$f";;
+  esac
+}
+extract_sources() {
+  local pkg="$1"
+  local srcdir="$EGO_CACHEDIR/src/$pkg"
+  local buildroot="$EGO_CACHEDIR/build/$pkg"
+  rm -rf "$buildroot"; mkdir -p "$buildroot"
+  local any=0
+  for f in "$srcdir"/*; do
+    [[ -e "$f" ]] || continue
+    any=1
+    local t; t=$(detect_type "$f")
+    case "$t" in
+      git) run "exportando git $(basename "$f")" bash -c "git -C '$f' archive --format=tar HEAD | tar -C '$buildroot' -xf -";;
+      "tar.gz")  run "extraindo $(basename "$f")" tar -C "$buildroot" -xzf "$f";;
+      "tar.bz2") run "extraindo $(basename "$f")" tar -C "$buildroot" -xjf "$f";;
+      "tar.xz")  run "extraindo $(basename "$f")" tar -C "$buildroot" -xJf "$f";;
+      "tar.zst"|"application/zstd"*) run "extraindo $(basename "$f")" tar -C "$buildroot" --zstd -xf "$f";;
+      zip|*"Zip archive"*) run "extraindo zip $(basename "$f")" unzip -q "$f" -d "$buildroot";;
+      7z|*"7-zip"*) run "extraindo 7z $(basename "$f")" 7z x -o"$buildroot" -y "$f";;
+      rar|*"RAR archive"*) run "extraindo rar $(basename "$f")" unrar x -o+ "$f" "$buildroot";;
+      *) warn "tipo desconhecido: $f (tentando tar)"; tar -C "$buildroot" -xf "$f" || true;;
+    esac
+  done
+  (( any )) || warn "nenhuma fonte extraída (talvez receita só baixe binários na fase package())"
+}
+
+# ====== Diretórios de fase ======
+phase_dirs() {
+  local pkg="$1"
+  export srcdir="$EGO_CACHEDIR/build/$pkg/$(ls -1 "$EGO_CACHEDIR/build/$pkg" 2>/dev/null | head -n1 || echo .)"
+  [[ -d "$srcdir" ]] || srcdir="$EGO_CACHEDIR/build/$pkg"
+  export builddir="$srcdir"
+  export pkgdir="$EGO_DESTDIR/$pkg"
+  mkdir -p "$pkgdir"
+}
+
+# ====== Patches automáticos ======
+autopatch_apply() {
+  local recipe_dir="$1" pkg="$2"
+  shopt -s nullglob
+  for p in "$recipe_dir"/*.patch "$EGO_CACHEDIR/src/$pkg"/*.patch; do
+    [[ -f "$p" ]] || continue
+    run "aplicando patch $(basename "$p")" patch -d "$srcdir" -p1 -i "$p"
+  done
+  shopt -u nullglob
+}
+
+# ====== Build pipeline ======
+do_build_pipeline() {
+  local pkg="$1" recipe="$2"
+  local recipe_dir; recipe_dir="$(dirname "$recipe")"
+  fetch_sources "$pkg" "$recipe_dir"
+  extract_sources "$pkg"
+  phase_dirs "$pkg"
+  # auto-patch salvo que options contenha noautopatch
+  if [[ " ${options[*]} " != *" noautopatch "* ]]; then
+    autopatch_apply "$recipe_dir" "$pkg"
+  fi
+  # exportar toolchain
+  export CC="$EGO_CC" CXX="$EGO_CXX" CFLAGS="$EGO_CFLAGS" CXXFLAGS="$EGO_CXXFLAGS" LDFLAGS="$EGO_LDFLAGS" MAKEFLAGS="$EGO_MAKEFLAGS"
+  # preparar/compilar/testar
+  run "prepare()" bash -c "cd \"$srcdir\" && declare -f prepare >/dev/null && prepare"
+  run "build()"   bash -c "cd \"$srcdir\" && declare -f build   >/dev/null && build"
+  if [[ "${EGO_WITH_CHECK:-0}" -eq 1 ]]; then
+    run "check()"   bash -c "cd \"$srcdir\" && declare -f check   >/dev/null && check"
+  fi
+  # package sob fakeroot se necessário
+  if (( EUID != 0 )); then
+    run "package() (fakeroot)" fakeroot -- bash -c "cd \"$srcdir\" && package"
+  else
+    run "package()" bash -c "cd \"$srcdir\" && package"
+  fi
+}
+
+# ====== Empacotar ======
+pack_package() {
+  local pkg="$1" arch; arch="$(uname -m)"
+  local outbase="${pkg}-${pkgver}-${pkgrel}-${arch}"
+  local outzst="$EGO_CACHEDIR/pkgs/$outbase.tar.zst"
+  local outxz="$EGO_CACHEDIR/pkgs/$outbase.tar.xz"
+  if command -v zstd >/dev/null 2>&1; then
+    run "empacotando $outbase.tar.zst" bash -c "tar -C \"$pkgdir\" -I 'zstd -19 -T0' -cf \"$outzst\" ."
+    echo "$(sha256_of "$outzst")  $(basename "$outzst")" > "$EGO_CACHEDIR/pkgs/$outbase.tar.zst.sha256"
+    echo "$outzst"
+  else
+    run "empacotando $outbase.tar.xz" bash -c "tar -C \"$pkgdir\" -I 'xz -T0 -9' -cf \"$outxz\" ."
+    echo "$(sha256_of "$outxz")  $(basename "$outxz")" > "$EGO_CACHEDIR/pkgs/$outbase.tar.xz.sha256"
+    echo "$outxz"
+  fi
+}
+
+# ====== Registro LOS ======
+gen_los_from_pkgdir() {
+  ( cd "$pkgdir" && find . -type f -o -type l -o -type d | sed 's|^\./||' | awk '{print "'"$EGO_ROOT"'/" $0}' )
+}
+
+# ====== Instalar pacote ======
+install_pkg_archive() {
+  local archive="$1"
+  run "instalando $(basename "$archive")" tar -C "$EGO_ROOT" -xf "$archive"
+}
+
+# ====== Strip opcional ======
+maybe_strip() {
+  [[ " ${options[*]} " == *" strip "* || "$EGO_STRIP_BINARIES" -eq 1 ]] || return 0
+  command -v strip >/dev/null 2>&1 || return 0
+  run "strip binários" bash -c "find '$EGO_ROOT/usr/bin' '$EGO_ROOT/usr/lib' -type f 2>/dev/null | xargs -r file | awk -F: '/ELF/ {print \$1}' | xargs -r strip --strip-unneeded || true"
+}
+# ====== META ======
+meta_write() {
+  local pkg="$1" ver="$2" arch="$(uname -m)" installed_dir; installed_dir="$(pkg_installed_dir "$pkg")"
+  mkdir -p "$installed_dir"
+  cat > "$(pkg_meta "$pkg")" <<EOF
+Name: $pkg
+Version: $ver
+Arch: $arch
+Installed: $(date -Is)
+Depends: ${depends[*]:-}
+MakeDepends: ${makedepends[*]:-}
+CheckDepends: ${checkdepends[*]:-}
+Provides: ${provides[*]:-}
+Conflicts: ${conflicts[*]:-}
+Replaces: ${replaces[*]:-}
+Packager: ego $EGO_VERSION
+License: ${license[*]:-}
+SHA256-Package: ${PKG_ARCHIVE_SHA256:-}
+EOF
+}
+meta_get_field() {
+  local pkg="$1" field="$2"
+  awk -F': ' -v f="$field" '$1==f{print $2}' "$(pkg_meta "$pkg")" 2>/dev/null || true
+}
+
+# ====== DB helpers ======
+is_installed() { [[ -f "$(pkg_meta "$1")" ]]; }
+installed_version() { meta_get_field "$1" "Version"; }
+record_los() { gen_los_from_pkgdir > "$(pkg_los "$1")"; }
+apply_los_remove() {
+  local pkg="$1"
+  local los; los="$(pkg_los "$pkg")"
+  [[ -f "$los" ]] || return 0
+  tac "$los" | while IFS= read -r path; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    rm -rf "$path" 2>/dev/null || true
+    rmdir -p --ignore-fail-on-non-empty "$(dirname "$path")" 2>/dev/null || true
+  done
+}
+
+# ====== Virtuals map ======
+VIRTUALS_MAP="/etc/ego/virtuals.map"
+pick_virtual_provider() {
+  local virtual="$1"
+  # 1) se algum instalado fornece, usa
+  for d in "$EGO_DBROOT/installed/"*/META; do
+    [[ -f "$d" ]] || continue
+    if grep -q "Provides: .*${virtual}" "$d"; then
+      basename "$(dirname "$d")"; return 0
+    fi
+  done
+  # 2) mapa preferências
+  if [[ -f "$VIRTUALS_MAP" ]]; then
+    local line provs
+    line="$(grep -E "^${virtual}[[:space:]]*=" "$VIRTUALS_MAP" | head -n1 || true)"
+    if [[ -n "$line" ]]; then
+      provs="${line#*=}"
+      for p in $provs; do echo "$p"; return 0; done
+    fi
+  fi
+  # 3) vazio = resolver depois via interação/erro
+  echo ""
+}
+
+# ====== Parser de dependência com versões ======
+# entrada "name", "name>=1.2", "virtual:editor", retorna: NAME OP VER TYPE
+parse_dep_token() {
+  local token="$1"
+  local name op ver
+  if [[ "$token" == virtual:* ]]; then
+    name="${token#virtual:}"
+    echo "virtual $name '' ''"; return 0
+  fi
+  if [[ "$token" =~ (.*)([><=~]{1,2})([^[:space:]]+)$ ]]; then
+    name="${BASH_REMATCH[1]}"; op="${BASH_REMATCH[2]}"; ver="${BASH_REMATCH[3]}"
+  else
+    name="$token"; op=""; ver=""
+  fi
+  echo "real $name $op $ver"
+}
+
+# ====== Grafo ======
+declare -A GRAPH INDEGREE NODE_SEEN
+GRAPH_CLEAR() { GRAPH=(); INDEGREE=(); NODE_SEEN=(); }
+GRAPH_ADD_EDGE() {
+  local from="$1" to="$2"
+  GRAPH["$from"]+="$to "
+  INDEGREE["$to"]=$(( ${INDEGREE["$to"]:-0} + 1 ))
+  NODE_SEEN["$from"]=1; NODE_SEEN["$to"]=1
+}
+
+# ====== Carregar metadados de uma receita sem executar ======
+recipe_metadata() {
+  local pkg="$1" repo="$2" rp; rp="$(find_recipe_path "$pkg" "$repo")"
+  load_recipe "$rp" >/dev/null 2>&1 || die "falha carregando receita de $pkg"
+}
+
+# ====== Resolver dependências (retorna plano ordenado) ======
+# Args: target pkgs... , modos: BUILD_DEPS=1 para incluir makedepends/checkdepends
+resolve_dependencies() {
+  local mode="$1"; shift
+  local targets=("$@")
+  local repo="$EGO_DEFAULT_REPO"
+  GRAPH_CLEAR
+  declare -A WANT_VER_OP WANT_VER
+  declare -A PROVIDER # virtual -> chosen
+  declare -A VISITED
+
+  # BFS pelos targets
+  local queue=("${targets[@]}")
+  while ((${#queue[@]})); do
+    local pkg="${queue[0]}"; queue=("${queue[@]:1}")
+    [[ -n "$pkg" && -z "${VISITED[$pkg]:-}" ]] || continue
+    VISITED["$pkg"]=1
+    recipe_metadata "$pkg" "$repo"  # carrega arrays depends/makedepends/...
+    # Expande virtuais nos depends selecionados por modo
+    local deps=("${depends[@]}")
+    if [[ "$mode" == "build" ]]; then
+      deps+=("${makedepends[@]}")
+      [[ "${EGO_WITH_CHECK:-0}" -eq 1 ]] && deps+=("${checkdepends[@]}")
+    fi
+    # optdepends promovidos por perfil (opcional)
+    if [[ -n "$EGO_PROFILE" && -f "/etc/ego/profiles/$EGO_PROFILE.promote" ]]; then
+      # linhas com nomes a promover
+      while IFS= read -r d; do deps+=("$d"); done < "/etc/ego/profiles/$EGO_PROFILE.promote"
+    fi
+
+    for d in "${deps[@]}"; do
+      [[ -z "$d" ]] && continue
+      read -r dtype dname dop dver < <(parse_dep_token "$d")
+      local depname=""
+      if [[ "$dtype" == "virtual" ]]; then
+        depname="${PROVIDER[$dname]:-}"
+        if [[ -z "$depname" ]]; then
+          depname="$(pick_virtual_provider "$dname")"
+          if [[ -z "$depname" ]]; then
+            if (( INTERACTIVE )); then
+              echo -e "${BOLD}Escolha provedor para virtual:${RESET} $dname"
+              read -rp "> " depname
+            else
+              die "sem provedor para virtual:$dname (configure /etc/ego/virtuals.map ou use -I)"
+            fi
+          fi
+          PROVIDER["$dname"]="$depname"
+        fi
+      else
+        depname="$dname"
+        [[ -n "$dop" ]] && { WANT_VER_OP["$depname"]="$dop"; WANT_VER["$depname"]="$dver"; }
+      fi
+      GRAPH_ADD_EDGE "$pkg" "$depname"
+      queue+=("$depname")
+    done
+  done
+
+  # Topological sort (Kahn)
+  local -a order=() q=()
+  for n in "${!NODE_SEEN[@]}"; do
+    if (( ${INDEGREE["$n"]:-0} == 0 )); then q+=("$n"); fi
+  done
+  IFS=$'\n' q=($(printf "%s\n" "${q[@]}" | sort)) # estabilidade por nome
+  while ((${#q[@]})); do
+    local n="${q[0]}"; q=("${q[@]:1}")
+    order+=("$n")
+    for m in ${GRAPH["$n"]:-}; do
+      INDEGREE["$m"]=$(( ${INDEGREE["$m"]:-0} - 1 ))
+      if (( INDEGREE["$m"] == 0 )); then q+=("$m"); fi
+    done
+    IFS=$'\n' q=($(printf "%s\n" "${q[@]}" | sort))
+  done
+
+  # Checar ciclos
+  if ((${#order[@]} != ${#NODE_SEEN[@]})); then
+    err "ciclo detectado na árvore de dependências"; return 4
+  fi
+
+  # Gera plano com status
+  local -a plan=()
+  for n in "${order[@]}"; do
+    # restrição de versão
+    local status="build"
+    if is_installed "$n"; then
+      local have; have="$(installed_version "$n")"
+      if [[ -n "${WANT_VER_OP[$n]:-}" ]]; then
+        if ! semver_satisfies "$have" "${WANT_VER_OP[$n]}" "${WANT_VER[$n]}"; then
+          status="upgrade"
+        else
+          status="present"
+        fi
+      else
+        status="present"
+      fi
+    else
+      status="build"
+    fi
+    plan+=("$n:$status")
+  done
+
+  # Remove itens que são apenas deps e já presentes quando o alvo é build-only?
+  printf "%s\n" "${plan[@]}"
+}
+
+# ====== Exibir plano ======
+print_plan() {
+  local title="$1"; shift
+  echo -e "${BOLD}${CYAN}Plano (${title}):${RESET}"
+  local i=1
+  for item in "$@"; do
+    local name="${item%%:*}" st="${item##*:}"
+    printf "  %2d. %-20s [%s]\n" "$i" "$name" "$st"
+    ((i++))
+  done
+}
+
+confirm_or_abort() {
+  (( INTERACTIVE )) || return 0
+  read -rp "Prosseguir? [s/N] " ans
+  [[ "${ans,,}" == "s" || "${ans,,}" == "y" ]] || die "abortado pelo usuário"
+}
+# ====== Build (sem instalar) ======
+cmd_build() {
+  local pkgs=("$@")
+  (( ${#pkgs[@]} )) || die "uso: ego build PKG..."
+  local plan; mapfile -t plan < <(resolve_dependencies build "${pkgs[@]}") || exit $?
+  print_plan "build" "${plan[@]}"
+  (( DRY_RUN )) && return 0
+  confirm_or_abort
+  for item in "${plan[@]}"; do
+    local p="${item%%:*}" st="${item##*:}"
+    [[ "$st" == "present" ]] && continue
+    local recipe; recipe="$(find_recipe_path "$p")"
+    load_recipe "$recipe"
+    do_build_pipeline "$p" "$recipe"
+    local archive; archive="$(pack_package "$p")"
+    PKG_ARCHIVE_SHA256="$(sha256_of "$archive")"
+    # não instala; apenas gera pacote
+    ok "build concluído: $p → $archive"
+  done
+}
+
+# ====== Install (construir e instalar) ======
+cmd_install() {
+  local use_binary="" ; if [[ "${1:-}" == "--binary" ]]; then use_binary="$2"; shift 2; fi
+  local pkgs=("$@")
+  (( ${#pkgs[@]} )) || { [[ -n "$use_binary" ]] || die "uso: ego install [--binary ARQ] PKG..."; }
+  if [[ -n "$use_binary" ]]; then
+    install_pkg_archive "$use_binary"; return 0
+  fi
+  local plan; mapfile -t plan < <(resolve_dependencies build "${pkgs[@]}") || exit $?
+  print_plan "install" "${plan[@]}"
+  (( DRY_RUN )) && return 0
+  confirm_or_abort
+  for item in "${plan[@]}"; do
+    local p="${item%%:*}" st="${item##*:}"
+    if [[ "$st" == "present" ]]; then
+      info "$p já presente"
+      continue
+    fi
+    local recipe; recipe="$(find_recipe_path "$p")"
+    load_recipe "$recipe"
+    do_build_pipeline "$p" "$recipe"
+    local archive; archive="$(pack_package "$p")"
+    PKG_ARCHIVE_SHA256="$(sha256_of "$archive")"
+    install_pkg_archive "$archive"
+    maybe_strip
+    record_los "$p"
+    meta_write "$p" "${pkgver}-${pkgrel}"
+    echo "$LOG_FILE" > "$(pkg_log "$p")"
+    ok "instalado: $p ${pkgver}-${pkgrel}"
+  done
+}
+
+# ====== Remove ======
+cmd_remove() {
+  (( $# )) || die "uso: ego remove PKG..."
+  (( DRY_RUN )) && { print_plan "remove" "$(printf '%s:remove\n' "$@")"; return 0; }
+  confirm_or_abort
+  for p in "$@"; do
+    is_installed "$p" || { warn "$p não está instalado"; continue; }
+    run_hook_dir pre-remove
+    apply_los_remove "$p"
+    rm -rf "$(pkg_installed_dir "$p")"
+    run_hook_dir post-remove
+    ok "removido $p"
+  done
+}
+
+# ====== Órfãos ======
+cmd_orphans() {
+  local do_remove=0
+  [[ "${1:-}" == "--remove" ]] && do_remove=1
+  # qualquer instalado que não é dependência de outro (e não marcado 'explicit' — simplificado: todos explicit)
+  declare -A is_dep
+  for m in "$EGO_DBROOT/installed/"*/META; do
+    [[ -f "$m" ]] || continue
+    awk -F': ' '/^Depends: /{print $2}' "$m" | tr ' ' '\n' | while read -r d; do
+      d="${d%%[><=~]*}"; [[ -n "$d" ]] && is_dep["$d"]=1
+    done
+  done
+  local orfs=()
+  for d in "$EGO_DBROOT/installed/"*; do
+    [[ -d "$d" ]] || continue
+    local name; name="$(basename "$d")"
+    [[ -z "${is_dep[$name]:-}" ]] && orfs+=("$name")
+  done
+  if ((${#orfs[@]}==0)); then ok "sem órfãos"; return 0; fi
+  echo -e "${BOLD}Órfãos:${RESET} ${orfs[*]}"
+  if (( do_remove )); then
+    (( DRY_RUN )) && { print_plan "remove órfãos" "$(printf '%s:remove\n' "${orfs[@]}")"; return 0; }
+    confirm_or_abort
+    cmd_remove "${orfs[@]}"
+  fi
+}
+
+# ====== Search ======
+cmd_search() {
+  (( $# )) || die "uso: ego search TERMO"
+  local term="${1,,}"
+  local idx="$EGO_SYNC_DIR/$EGO_DEFAULT_REPO/.index/packages.meta"
+  if [[ -f "$idx" ]]; then
+    grep -i -- "$term" "$idx" | sed 's/^/- /'
+  else
+    # varre diretórios
+    for d in "$EGO_SYNC_DIR/$EGO_DEFAULT_REPO"/*; do
+      [[ -d "$d" && -f "$d/ego.build" ]] || continue
+      local name; name="$(basename "$d")"
+      if [[ "${name,,}" == *"$term"* ]]; then echo "- $name"; fi
+    done
+  fi
+}
+
+# ====== Info ======
+cmd_info() {
+  (( $# )) || die "uso: ego info PKG"
+  local p="$1" recipe; recipe="$(find_recipe_path "$p")"
+  load_recipe "$recipe"
+  echo -e "${BOLD}$p${RESET} ${pkgver}-${pkgrel}"
+  echo "desc: $pkgdesc"
+  echo "url : $url"
+  echo "deps: ${depends[*]:-}"
+  echo "mkdp: ${makedepends[*]:-}"
+  echo "opt : ${optdepends[*]:-}"
+  echo "prov: ${provides[*]:-}"
+  echo "conf: ${conflicts[*]:-}"
+  if is_installed "$p"; then
+    echo "inst: $(installed_version "$p")"
+    echo "arquivos:"
+    sed 's|^|  |' "$(pkg_los "$p")" | head -n 20
+    [[ $(wc -l <"$(pkg_los "$p")") -gt 20 ]] && echo "  ... (use 'cat $(pkg_los "$p")')"
+  else
+    echo "inst: (não instalado)"
+  fi
+}
+
+# ====== List ======
+cmd_list() {
+  local mode="${1:-}"
+  for d in "$EGO_DBROOT/installed/"*; do
+    [[ -d "$d" ]] || continue
+    local n; n="$(basename "$d")"
+    echo "$n $(installed_version "$n")"
+  done | sort
+}
+
+# ====== Verify ======
+cmd_verify() {
+  (( $# )) || die "uso: ego verify PKG|FILE"
+  if [[ -f "$1" ]]; then
+    sha256sum "$1"
+  else
+    local p="$1"
+    local meta; meta="$(pkg_meta "$p")"; [[ -f "$meta" ]] || die "não instalado: $p"
+    echo "Pacote instalado: $p $(installed_version "$p")"
+    echo "Arquivos:"
+    sha256sum $(sed 's|^|'"$EGO_ROOT"'|g' "$(pkg_los "$p")") 2>/dev/null || true
+  fi
+}
+
+# ====== Checksum ======
+cmd_checksum() {
+  (( $# )) || die "uso: ego checksum FILES..."
+  sha256sum "$@"
+}
+
+# ====== Repo-index ======
+cmd_repo_index() {
+  local path="${1:-$EGO_SYNC_DIR/$EGO_DEFAULT_REPO}"
+  mkdir -p "$path/.index"
+  : > "$path/.index/packages.meta"
+  for d in "$path"/*; do
+    [[ -d "$d" && -f "$d/ego.build" ]] || continue
+    local name; name="$(basename "$d")"
+    echo "$name" >> "$path/.index/packages.meta"
+  done
+  ok "índice gerado em $path/.index/packages.meta"
+}
+
+# ====== Sync ======
+cmd_sync() {
+  load_repos
+  for name in "${!REPOS[@]}"; do
+    local src="${REPOS[$name]}" dst="$EGO_SYNC_DIR/$name"
+    mkdir -p "$EGO_SYNC_DIR"
+    if [[ "$src" =~ ^https?://|^git@ ]]; then
+      if [[ -d "$dst/.git" ]]; then
+        run "sync repo $name (git pull)" git -C "$dst" pull --ff-only
+      else
+        run "sync repo $name (git clone)" git clone --depth=1 "$src" "$dst"
+      fi
+    else
+      # diretório local
+      if [[ -d "$dst" ]]; then
+        run "espelhando $src → $dst" rsync -a --delete "$src/." "$dst/."
+      else
+        run "copiando $src → $dst" rsync -a "$src/." "$dst/."
+      fi
+    fi
+    ( cd "$dst" && cmd_repo_index "$dst" >/dev/null )
+    if (( EGO_GIT_PUSH )) && [[ -d "$dst/.git" ]]; then
+      git -C "$dst" add .index/packages.meta >/dev/null 2>&1 || true
+      git -C "$dst" commit -m "ego: update index" >/dev/null 2>&1 || true
+      git -C "$dst" push >/dev/null 2>&1 || true
+    fi
+  done
+  ok "sync concluído"
+}
+
+# ====== Upgrade ======
+cmd_upgrade() {
+  if [[ "${1:-}" != "--all" && $# -gt 0 ]]; then
+    local targets=("$@")
+    mapfile -t plan < <(resolve_dependencies build "${targets[@]}") || exit $?
+  else
+    # todos os explicit (simplificado: todos instalados)
+    local all=()
+    for d in "$EGO_DBROOT/installed/"*; do
+      [[ -d "$d" ]] || continue; all+=("$(basename "$d")")
+    done
+    mapfile -t plan < <(resolve_dependencies build "${all[@]}") || exit $?
+  fi
+  print_plan "upgrade" "${plan[@]}"
+  (( DRY_RUN )) && return 0
+  confirm_or_abort
+  # simplificado: para cada item status != present, rebuild
+  for item in "${plan[@]}"; do
+    local p="${item%%:*}" st="${item##*:}"
+    [[ "$st" == "present" ]] && continue
+    local recipe; recipe="$(find_recipe_path "$p")"
+    load_recipe "$recipe"
+    do_build_pipeline "$p" "$recipe"
+    local archive; archive="$(pack_package "$p")"
+    PKG_ARCHIVE_SHA256="$(sha256_of "$archive")"
+    install_pkg_archive "$archive"
+    maybe_strip
+    record_los "$p"
+    meta_write "$p" "${pkgver}-${pkgrel}"
+    echo "$LOG_FILE" > "$(pkg_log "$p")"
+    ok "upgrade: $p ${pkgver}-${pkgrel}"
+  done
+}
+
+# ====== World (recompilar tudo) ======
+cmd_world() {
+  local all=()
+  for d in "$EGO_DBROOT/installed/"*; do
+    [[ -d "$d" ]] || continue; all+=("$(basename "$d")")
+  done
+  (( ${#all[@]} )) || { warn "nenhum pacote instalado"; return 0; }
+  mapfile -t plan < <(resolve_dependencies build "${all[@]}") || exit $?
+  print_plan "world" "${plan[@]}"
+  (( DRY_RUN )) && return 0
+  confirm_or_abort
+  for item in "${plan[@]}"; do
+    local p="${item%%:*}"
+    local recipe; recipe="$(find_recipe_path "$p")"
+    load_recipe "$recipe"
+    do_build_pipeline "$p" "$recipe"
+    local archive; archive="$(pack_package "$p")"
+    PKG_ARCHIVE_SHA256="$(sha256_of "$archive")"
+    install_pkg_archive "$archive"
+    maybe_strip
+    record_los "$p"
+    meta_write "$p" "${pkgver}-${pkgrel}"
+    echo "$LOG_FILE" > "$(pkg_log "$p")"
+    ok "world rebuild: $p ${pkgver}-${pkgrel}"
+  done
+}
+
+# ====== Help ======
+show_help() {
+  cat <<EOF
+ego $EGO_VERSION — gerenciador de programas Linux baseado em source
+Uso: ego [opções globais] <comando> [args]
+
+Opções globais:
+  --color=auto|always|never
+  --no-spinner
+  --root DIR
+  --repo NAME|PATH
+  --yes
+  --force
+  --debug
+  -I, --interactive
+  -n, --dry-run
+
+Atalhos:
+  -i PKG        == install PKG
+  -r PKG        == remove PKG
+  -s TERMO      == search TERMO
+  -u [PKG|--all]== upgrade
+  -w            == world
+  -l            == list
+  -h            == help
+
+Comandos:
+  sync                 # sincroniza repositórios + índice
+  fetch  PKG...        # apenas baixar fontes
+  extract PKG...       # apenas descompactar (após fetch)
+  build  PKG...        # compila e empacota (sem instalar)
+  install PKG...       # constrói/instala (ou --binary ARQ)
+  remove PKG...        # desinstala
+  orphans [--remove]   # lista/remove órfãos
+  upgrade [PKG|--all]  # atualiza/recompila
+  world                # recompila o sistema inteiro com ordem topológica
+  search TERMO         # busca
+  info   PKG           # metadados
+  list                 # pacotes instalados
+  verify PKG|FILE      # sha256/verificação
+  checksum FILES...    # gera sha256
+  repo-index [PATH]    # gera índice .index/packages.meta
+EOF
+}
+
+# ====== CLI ======
+main() {
+  load_conf
+  load_repos
+
+  # parse flags/atalhos
+  while (( $# )); do
+    case "$1" in
+      -h|--help) show_help; exit 0;;
+      -n|--dry-run) DRY_RUN=1; shift;;
+      -I|--interactive) INTERACTIVE=1; shift;;
+      --debug) DEBUG=1; set -x; shift;;
+      --force) FORCE=1; shift;;
+      --no-spinner) EGO_SPINNER=0; shift;;
+      --color=*) EGO_COLOR="${1#*=}"; shift;;
+      --root) EGO_ROOT="$2"; shift 2;;
+      --repo) EGO_DEFAULT_REPO="$2"; shift 2;;
+      --yes) INTERACTIVE=0; shift;; # efetivamente ignora prompts
+      -i) CMD="install"; shift; ARGS+=("$@"); set -- ;;   # trata abaixo
+      -r) CMD="remove"; shift; ARGS+=("$@"); set -- ;;
+      -s) CMD="search"; shift; ARGS+=("$@"); set -- ;;
+      -u) CMD="upgrade"; shift; ARGS+=("$@"); set -- ;;
+      -w) CMD="world"; shift;;
+      -l) CMD="list"; shift;;
+      --) shift; break;;
+      -*)
+        die "flag desconhecida: $1";;
+      *)
+        # primeiro token não-flag => comando
+        CMD="$1"; shift; break;;
+    esac
+  done
+  # resto são args do comando
+  if [[ -z "$CMD" ]]; then [[ $# -gt 0 ]] && { CMD="$1"; shift; } || { show_help; exit 1; }; fi
+  ARGS+=("$@")
+
+  case "$CMD" in
+    sync)      cmd_sync "${ARGS[@]}";;
+    fetch)     cmd_build "${ARGS[@]}" ;;      # fetch está incluso em build; mantido simples
+    extract)   warn "use 'build' (extract incluso)";;
+    build)     cmd_build "${ARGS[@]}";;
+    install)   cmd_install "${ARGS[@]}";;
+    remove)    cmd_remove "${ARGS[@]}";;
+    orphans)   cmd_orphans "${ARGS[@]}";;
+    upgrade)   cmd_upgrade "${ARGS[@]}";;
+    world)     cmd_world  "${ARGS[@]}";;
+    search)    cmd_search "${ARGS[@]}";;
+    info)      cmd_info   "${ARGS[@]}";;
+    list)      cmd_list   "${ARGS[@]}";;
+    verify)    cmd_verify "${ARGS[@]}";;
+    checksum)  cmd_checksum "${ARGS[@]}";;
+    repo-index)cmd_repo_index "${ARGS[@]}";;
+    *) die "comando desconhecido: $CMD";;
+  esac
+}
+
+main "$@"
