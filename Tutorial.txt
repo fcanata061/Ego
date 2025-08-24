@@ -1,0 +1,238 @@
+EGO - Gerenciador de Pacotes Source-Based
+=========================================
+
+ÍNDICE
+-------
+1. O que é o Ego
+2. Instalação
+3. Estrutura de diretórios
+4. Configuração
+5. Comandos básicos
+6. Variáveis importantes
+7. Flags e opções
+8. Receitas (build scripts)
+9. Exemplo completo: GCC
+10. Empacotamento, instalação e remoção
+11. Atualização e rebuild do sistema (world)
+12. Notas finais
+
+---
+
+1. O QUE É O EGO
+----------------
+O Ego é um gerenciador de pacotes Linux source-based, inspirado em Portage/PKGBUILD. Ele permite:
+- Compilar programas a partir do código-fonte.
+- Resolver dependências automaticamente.
+- Aplicar patches.
+- Empacotar e instalar programas.
+- Criar e manter repositórios locais ou remotos.
+- Recompilar todo o sistema (“world rebuild”).
+- Gerenciar logs, hashes SHA256, hooks, versões e upgrades automáticos.
+
+---
+
+2. INSTALAÇÃO
+-------------
+Requisitos mínimos:
+- Bash 5+
+- Make, GCC, Binutils
+- Curl, Wget, Git
+- Python 3
+- Ferramentas de descompactação: tar, unzip, xz, bzip2
+
+Passo a passo:
+
+git clone https://github.com/seuusuario/ego.git /opt/ego
+cd /opt/ego
+make install
+export PATH=/opt/ego/bin:$PATH
+
+---
+
+3. ESTRUTURA DE DIRETÓRIOS
+--------------------------
+$EGO_ROOT/           -> raiz do sistema Ego (onde pacotes são instalados)
+$EGO_ROOT/bin        -> binários
+$EGO_ROOT/lib        -> bibliotecas
+$EGO_ROOT/include    -> headers
+$EGO_REPO/           -> receitas (ex: recipes/)
+$EGO_CACHE/          -> tarballs baixados
+$EGO_BUILD/          -> diretórios temporários de build
+$EGO_LOGS/           -> logs de compilação
+
+---
+
+4. CONFIGURAÇÃO
+---------------
+Arquivo de configuração: ~/.ego/ego.conf
+
+Exemplo:
+
+EGO_ROOT=/usr/local/ego
+EGO_REPO=$HOME/ego-repo
+EGO_CACHE=$HOME/.ego/cache
+EGO_BUILD=$HOME/.ego/build
+EGO_LOGS=$HOME/.ego/logs
+EGO_MAKEFLAGS="-j$(nproc)"
+
+---
+
+5. COMANDOS BÁSICOS
+-------------------
+ego fetch <pacote>        -> baixa a fonte do pacote
+ego checksum <pacote>     -> gera/verifica SHA256
+ego build <pacote>        -> compila o pacote
+ego install <pacote>      -> instala o pacote
+ego remove <pacote>       -> remove o pacote
+ego world                 -> recompila todo o sistema em ordem de dependências
+ego update                -> atualiza repositórios
+ego search <pacote>       -> pesquisa por pacote
+ego info <pacote>         -> exibe informações detalhadas
+
+---
+
+6. VARIÁVEIS IMPORTANTES
+------------------------
+pkgname         -> nome do pacote
+pkgver          -> versão
+pkgrel          -> release interno
+pkgdesc         -> descrição
+license         -> licença
+arch            -> arquiteturas suportadas
+source          -> URLs da fonte
+sha256sums      -> hashes SHA256 das fontes
+depends         -> dependências de runtime
+makedepends     -> dependências de build
+optdepends      -> dependências opcionais
+provides        -> pacotes virtuais fornecidos
+conflicts       -> pacotes conflitantes
+replaces        -> pacotes substituídos
+options         -> opções especiais (ex: strip)
+builddir        -> diretório de build temporário
+pkgdir          -> diretório de empacotamento (DESTDIR)
+
+---
+
+7. FLAGS E OPÇÕES
+-----------------
+-i       -> instalar pacote após build
+-h       -> ajuda
+--force  -> força ações mesmo com conflitos
+--sync   -> sincroniza repositório com Git
+--upgrade-> atualiza pacote para versão maior
+--world  -> recompila todo o sistema
+
+---
+
+8. RECEITAS (BUILD SCRIPTS)
+---------------------------
+- São scripts bash que descrevem como baixar, preparar, compilar, testar e instalar pacotes.
+- Funções padrão:
+  prepare() -> aplica patches, configura ambiente
+  build()   -> compila o pacote
+  check()   -> executa testes opcionais
+  package() -> empacota para DESTDIR
+  install() -> instala o pacote no EGO_ROOT
+
+---
+
+9. EXEMPLO COMPLETO: GCC
+------------------------
+
+# gcc.ego — Receita de build para GNU Compiler Collection (GCC)
+
+pkgname="gcc"
+pkgver="15.2.0"
+pkgrel="1"
+pkgdesc="GNU Compiler Collection (C, C++, Fortran, Go, etc.)"
+url="https://gcc.gnu.org/"
+license=("GPL-3.0-or-later")
+arch=("x86_64" "aarch64")
+maintainer="Seu Nome <voce@example.com>"
+
+source=("https://ftp.gnu.org/gnu/gcc/gcc-${pkgver}/gcc-${pkgver}.tar.xz")
+sha256sums=("<SHA256_AQUI>")
+
+depends=("glibc" "zlib")
+makedepends=("make" "autoconf" "automake" "gawk" "m4" "flex" "bison" "texinfo" "python3"
+             "gmp" "mpfr" "mpc" "isl" "zlib" "binutils" "libtool")
+optdepends=("libmpx: optional memory protection support")
+
+provides=("gcc")
+options=("strip")
+
+gcc_enabled_languages=("c" "c++" "fortran" "go")
+
+prepare() {
+  cd "$srcdir/gcc-${pkgver}" || return 1
+  if [[ -x contrib/download_prerequisites ]]; then
+    ./contrib/download_prerequisites || die "falha download_prerequisites"
+  fi
+}
+
+build() {
+  mkdir -p "$builddir/gcc-${pkgver}-build"
+  cd "$builddir/gcc-${pkgver}-build" || return 1
+  local langs="${gcc_enabled_languages[*]// /,}"
+  "$srcdir/gcc-${pkgver}/configure" \
+    --prefix=/usr \
+    --libdir=/usr/lib \
+    --enable-languages=${langs} \
+    --enable-shared \
+    --enable-threads=posix \
+    --enable-__cxa_atexit \
+    --enable-lto \
+    --enable-plugin \
+    --with-system-zlib \
+    --disable-multilib \
+    --disable-bootstrap \
+    --enable-checking=release \
+    CFLAGS="${EGO_CFLAGS}" \
+    CXXFLAGS="${EGO_CXXFLAGS}" \
+    LDFLAGS="${EGO_LDFLAGS}"
+  make ${EGO_MAKEFLAGS}
+}
+
+check() {
+  if [[ "${EGO_WITH_CHECK:-0}" -eq 1 ]]; then
+    cd "$builddir/gcc-${pkgver}-build" || return 1
+    make -k check || warn "alguns testes falharam"
+  fi
+}
+
+package() {
+  cd "$builddir/gcc-${pkgver}-build" || return 1
+  make install DESTDIR="$pkgdir"
+  install -Dm644 "$srcdir/gcc-${pkgver}/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
+
+---
+
+10. EMPACOTAMENTO, INSTALAÇÃO E REMOÇÃO
+---------------------------------------
+- `ego package <pacote>` -> cria pacote usando DESTDIR
+- `ego install <pacote>` -> instala pacote compilado
+- `ego remove <pacote>` -> remove pacote
+- `ego remove --orphans` -> remove pacotes órfãos sem dependentes
+
+---
+
+11. ATUALIZAÇÃO E REBUILD DO SISTEMA (WORLD)
+--------------------------------------------
+- `ego world` -> recompila todos os pacotes instalados em ordem de dependências
+- `ego update` -> sincroniza repositório e atualiza receitas
+- `ego upgrade <pacote>` -> atualiza pacote para versão maior
+- `ego sync` -> sincroniza diretório local com repositório Git
+
+---
+
+12. NOTAS FINAIS
+----------------
+- O Ego suporta logging completo de builds.
+- Permite hooks antes/depois de cada etapa.
+- Cria hashes SHA256 automáticos para verificar integridade.
+- Pode usar `fakeroot` para empacotamento sem permissões de root.
+- Flags como --force e --upgrade ajudam na manutenção avançada.
+- Combina simplicidade com controle completo de pacotes e builds source-based.
+
+FIM DO TUTORIAL
