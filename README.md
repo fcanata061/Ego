@@ -33,7 +33,7 @@ Ego é um **gerenciador de pacotes Linux source-based**, inspirado em Portage e 
 
 ``` bash
 # Clonar o repositório
-git clone https://github.com/seuusuario/ego.git /opt/ego
+git clone https://github.com/fcanata061/Ego.git /opt/ego
 
 # Instalar
 cd /opt/ego
