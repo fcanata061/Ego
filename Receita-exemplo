@@ -1,0 +1,132 @@
+# ego.build — receita para gcc 15.2.0
+pkgname="gcc"
+pkgver="15.2.0"
+pkgrel="1"
+pkgdesc="The GNU Compiler Collection (C, C++, Fortran, Go, ...)"
+url="https://gcc.gnu.org/"
+license=( "GPL-3.0-or-later" )
+arch=( "x86_64" "aarch64" )
+maintainer="Seu Nome <voce@example.com>"
+
+# Fonte: tarball oficial (GCC 15.2.0 release). Confirme mirrors/sha256 após fetch. 
+# (release: Aug 8, 2025). Fonte oficial: ftp.gnu.org / gcc/gcc-15.2.0/
+source=( "https://ftp.gnu.org/gnu/gcc/gcc-${pkgver}/gcc-${pkgver}.tar.xz" )
+
+# Substitua pelos SHA256 corretos após baixar (placeholder abaixo)
+sha256sums=( "<SHA256_OF_gcc-${pkgver}.tar.xz>" )
+
+# Dependências: runtime/optional
+depends=( "glibc" "zlib" )   # runtime system libs (ajuste conforme seu sistema)
+# Dependências de build — se preferir não usar contrib/download_prerequisites,
+# instale libgmp-dev, libmpfr-dev, libmpc-dev, isl-dev (nomes de pacotes variam por distro).
+makedepends=( "make" "autoconf" "automake" "gawk" "m4" "flex" "bison" "texinfo" "python3" "gmp" "mpfr" "mpc" "isl" "zlib" "binutils" "libtool" )
+
+# Opcional: optdepends podem ser ativadas via perfil
+optdepends=( "libmpx: optional memory protection libs" )
+
+provides=( "gcc" )
+conflicts=()
+replaces=()
+options=( "strip" )
+
+# Por padrão, buildará linguagens essenciais. Ajuste conforme necessidade.
+# Atenção: adicionar muitas linguagens aumenta tempo/recursos.
+gcc_enabled_languages=( "c" "c++" "fortran" "go" )
+
+# Diretório de build (objdir separado do srcdir)
+_build_dirname="build-gcc-${pkgver}"
+
+prepare() {
+  # colocamos o tarball no srcdir automaticamente; aqui rodamos o helper
+  # que baixa/organiza gmp/mpfr/mpc/isl se estiver disponível no tarball.
+  #
+  # Nota: contrib/download_prerequisites vem dentro do tarball do GCC.
+  #
+  # Se preferir controlar versões das libs de suporte manualmente,
+  # instale-as no sistema (makedepends) e comente o comando abaixo.
+  cd "$srcdir" || return 1
+
+  if [[ -x "contrib/download_prerequisites" ]]; then
+    echo "Executando contrib/download_prerequisites para obter GMP/MPFR/MPC/ISL (in-tree)..."
+    ./contrib/download_prerequisites || die "download_prerequisites falhou"
+  else
+    warn "contrib/download_prerequisites não encontrado — verifique fontes"
+  fi
+
+  # correções locais ou patches podem ser aplicados aqui (ex.: patch -p1 < fix.patch)
+  # Exemplo: patch -p1 < "$recipe_dir/mypatch.patch"
+}
+
+build() {
+  # Cria objdir fora do src para builds limpos
+  mkdir -p "$builddir/$_build_dirname"
+  cd "$builddir/$_build_dirname" || return 1
+
+  # Configurações padrão - ajuste flags conforme política da sua distro
+  local langs
+  IFS=, read -r -a _tmp <<<"${gcc_enabled_languages[*]// /,}"
+  langs="${gcc_enabled_languages[*]// /,}"
+
+  local cfg_args=(
+    "$srcdir/configure"
+    "--prefix=/usr"
+    "--libdir=/usr/lib"
+    "--enable-languages=${langs}"
+    "--enable-shared"
+    "--enable-threads=posix"
+    "--enable-__cxa_atexit"
+    "--enable-lto"
+    "--enable-plugin"
+    "--with-system-zlib"
+    "--disable-multilib"    # simplifica para sistemas x86_64; remova se quiser multilib
+    "--disable-bootstrap"   # opcional: evita bootstrap para acelerar (mas recomenda-se bootstrap para release)
+    "--enable-checking=release"
+    "CFLAGS=${EGO_CFLAGS}"
+    "CXXFLAGS=${EGO_CXXFLAGS}"
+    "LDFLAGS=${EGO_LDFLAGS}"
+  )
+
+  # Se quiser fazer bootstrap (recomendado para produção), remova --disable-bootstrap
+  run "configure gcc ${pkgver}" "${cfg_args[@]}"
+
+  # Compilar: esse passo é pesado — ajuste MAKEFLAGS em ego.conf
+  run "make -j ${EGO_MAKEFLAGS}" make ${EGO_MAKEFLAGS}
+}
+
+check() {
+  # testes de regressão (pode demorar muito)
+  # deixamos opcional; habilite com EGO_WITH_CHECK=1 ao chamar ego
+  if [[ "${EGO_WITH_CHECK:-0}" -eq 1 ]]; then
+    cd "$builddir/$_build_dirname" || return 1
+    run "make check (pode demorar muito)" make -k check || warn "alguns testes falharam (continuando)"
+  fi
+}
+
+package() {
+  # instancia pkgdir (DESTDIR) e instala para empacotamento
+  mkdir -p "$pkgdir"
+  cd "$builddir/$_build_dirname" || return 1
+
+  # install usando DESTDIR para empacotamento
+  run "make install (DESTDIR=$pkgdir)" make install DESTDIR="$pkgdir"
+
+  # licenças / docs
+  install -d "$pkgdir/usr/share/licenses/$pkgname"
+  if [[ -f "$srcdir/COPYING" ]]; then
+    install -m644 "$srcdir/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  fi
+
+  # Ajustes pós-instalação no pkgdir (strip opcional será feito pelo ego global)
+  # Gerar LOS (o ego principal irá usar o pkgdir para montar o pacote)
+}
+
+install() {
+  # comportamento padrão do ego: instalar pacote empacotado
+  # mas deixamos um método direto caso queira permitir install direto do build
+  # (não recomendado fora de ambiente controlado)
+  if [[ -n "${pkgdir:-}" && -d "$pkgdir" ]]; then
+    run "instalando (rsync) para $EGO_ROOT" rsync -a "$pkgdir/" "$EGO_ROOT/"
+  else
+    die "pkgdir não encontrado — use 'package' antes de 'install' ou use o comando ego install que trata DESTDIR automaticamente"
+  fi
+}
